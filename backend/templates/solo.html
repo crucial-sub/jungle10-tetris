@@ -27,7 +27,7 @@
 				<p>{{ user_name }}</p>
 				<p id="high-score">최고 점수 : {{ user_high_score }}</p>
 				<p id="score">점수 : 0</p>
-				<p id="time">남은 시간 : 60sec</p>
+				<p id="time">남은 시간 : 60초</p>
 			</div>
 		</main>
 		<div id="modal" class="hidden">
@@ -87,7 +87,6 @@
 			current: null,
 			over: false
 			};
-
 			const time = {
 			start: 0,
 			elapsed: 0,
@@ -110,7 +109,7 @@
 			}
 
 			function updateTime() {
-			document.getElementById('time').textContent = `남은 시간: ${time.remaining}sec`;
+			document.getElementById('time').textContent = `남은 시간 : ${time.remaining}초`;
 			}
 
 			async function fetchGameStart() {
@@ -153,7 +152,7 @@
 					
 					const html = `
 						<div class="flex flex-col justify-center items-center gap-12 text-center">
-						<p class="text-green-500 text-[40px]">점수: ${score}</p>
+						<p class="text-green-500 text-[40px]">점수 : ${score}</p>
 						<button id="confirm-btn" class="mt-[22px] w-[150px] h-[62px] bg-green-500 text-white text-[40px] font-bold rounded-[20px] hover:bg-green-600 transition text-center items-center">확인</button>
 						</div>
 					`
@@ -188,13 +187,17 @@
 				game.over = false;
 				score = 0;
 				updateScore();
-				time.start = performance.now();
+
+				time.start = Date.now();
+				time.total = gameDuration;
 				time.remaining = gameDuration;
-				time.lastTick = 0;
+				time.lastTick = Date.now();
+
 				updateTime();
 				animate();
 				render();
 			}
+
 
 			function render() {
 			clear();
@@ -364,36 +367,38 @@
 			}
 
 			function updateScore() {
-			document.getElementById('score').textContent = `점수: ${score}`;
+				document.getElementById('score').textContent = `점수 : ${score}`;
 			}
 
-			function animate(now = 0) {
-			if (game.over) {
-				render();
-				return;
-			}
-
-			time.elapsed = now - time.start;
-
-			if (time.elapsed > time.interval) {
-				time.start = now;
-				move(0, 1);
-			}
-
-			if (Math.floor(now / 1000) !== Math.floor(time.lastTick / 1000)) {
-				time.remaining--;
-				time.lastTick = now;
-				updateTime();
-
-				if (time.remaining <= 0) {
-				game.over = true;
-				render();
-				return;
+			function animate() {
+				if (game.over) {
+					render();
+					return;
 				}
-			}
 
-			render();
-			requestAnimationFrame(animate);
+				const now = Date.now();
+				const secondsPassed = Math.floor((now - time.start) / 1000);
+				const newRemaining = Math.max(0, time.total - secondsPassed);
+
+				if (newRemaining !== time.remaining) {
+					time.remaining = newRemaining;
+					updateTime();
+
+					if (time.remaining <= 0) {
+						game.over = true;
+						render();
+						return;
+					}
+				}
+
+				// 블럭 아래로 이동 (고정 간격 유지)
+				if (now - time.lastTick > time.interval) {
+					time.lastTick = now;
+					move(0, 1);
+				}
+
+				render();
+				requestAnimationFrame(animate);
 			}
 
 			function onKeyDown(e) {
