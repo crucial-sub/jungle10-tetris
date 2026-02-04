@@ -70,6 +70,38 @@
 
 			const COLORS = ['cyan', 'blue', 'orange', 'yellow', 'green', 'purple', 'red'];
 
+			// Seeded PRNG (Mulberry32 algorithm) for deterministic block generation
+			class SeededRandom {
+				constructor(seed) {
+					this.state = seed;
+				}
+				next() {
+					let t = this.state += 0x6D2B79F5;
+					t = Math.imul(t ^ t >>> 15, t | 1);
+					t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+					return ((t ^ t >>> 14) >>> 0) / 4294967296;
+				}
+				nextInt(max) {
+					return Math.floor(this.next() * max);
+				}
+			}
+
+			// Game seed and RNG instance
+			let gameSeed = null;
+			let rng = null;
+
+			// Input logging for replay
+			const inputLog = { seed: null, startTime: null, inputs: [] };
+			let frameCount = 0;
+
+			function logInput(action) {
+				inputLog.inputs.push({
+					frame: frameCount,
+					action: action,
+					timestamp: performance.now() - inputLog.startTime
+				});
+			}
+
 			const BLOCK_SHAPES = [
 			{ blocks: [[-1, 0], [0, 0], [1, 0], [2, 0]], center: [0, 0] },
 			{ blocks: [[-1, 0], [0, 0], [1, 0], [1, -1]], center: [0, 0] },
@@ -145,7 +177,9 @@
 						'credentials': 'include'
 					},
 					body: JSON.stringify({
-						score: score
+						score: score,
+						input_log: inputLog.inputs,
+						game_seed: inputLog.seed
 					})
 					});
 
@@ -183,6 +217,16 @@
 			}
 
 			function startGame(gameDuration) {
+				// Initialize seeded random for deterministic block generation
+				gameSeed = Date.now();
+				rng = new SeededRandom(gameSeed);
+
+				// Initialize input log for replay
+				inputLog.seed = gameSeed;
+				inputLog.startTime = performance.now();
+				inputLog.inputs = [];
+				frameCount = 0;
+
 				game.grid = initializeBoard();
 				game.current = generateBlock();
 				game.over = false;
@@ -251,20 +295,21 @@
 			}
 
 			function generateBlock() {
-			const index = Math.floor(Math.random() * BLOCK_SHAPES.length);
-			const { blocks, center } = BLOCK_SHAPES[index];
-			const color = COLORS[index];
-			const minDy = Math.min(...blocks.map(([_, dy]) => dy));
+				// Use seeded random for deterministic block generation (replay support)
+				const index = rng ? rng.nextInt(BLOCK_SHAPES.length) : Math.floor(Math.random() * BLOCK_SHAPES.length);
+				const { blocks, center } = BLOCK_SHAPES[index];
+				const color = COLORS[index];
+				const minDy = Math.min(...blocks.map(([_, dy]) => dy));
 
-			const newBlock = {
-				x: 4,
-				y: -minDy,
-				color,
-				blocks,
-				center
-			};
+				const newBlock = {
+					x: 4,
+					y: -minDy,
+					color,
+					blocks,
+					center
+				};
 
-			if (isColliding(game.grid, newBlock, newBlock.x, newBlock.y)) {
+				if (isColliding(game.grid, newBlock, newBlock.x, newBlock.y)) {
 				game.over = true;
 			}
 
@@ -368,46 +413,54 @@
 			}
 
 			function animate(now = 0) {
-			if (game.over) {
-				render();
-				return;
-			}
-
-			time.elapsed = now - time.start;
-
-			if (time.elapsed > time.interval) {
-				time.start = now;
-				move(0, 1);
-			}
-
-			if (Math.floor(now / 1000) !== Math.floor(time.lastTick / 1000)) {
-				time.remaining--;
-				time.lastTick = now;
-				updateTime();
-
-				if (time.remaining <= 0) {
-				game.over = true;
-				render();
-				return;
+				if (game.over) {
+					render();
+					return;
 				}
-			}
 
-			render();
-			requestAnimationFrame(animate);
+				// Increment frame count for replay synchronization
+				frameCount++;
+
+				time.elapsed = now - time.start;
+
+				if (time.elapsed > time.interval) {
+					time.start = now;
+					move(0, 1);
+				}
+
+				if (Math.floor(now / 1000) !== Math.floor(time.lastTick / 1000)) {
+					time.remaining--;
+					time.lastTick = now;
+					updateTime();
+
+					if (time.remaining <= 0) {
+						game.over = true;
+						render();
+						return;
+					}
+				}
+
+				render();
+				requestAnimationFrame(animate);
 			}
 
 			function onKeyDown(e) {
-			const moveAction = MOVES[e.keyCode];
-			if (moveAction) {
-				e.preventDefault();
-				move(moveAction.dx, moveAction.dy);
-			} else if (e.keyCode === KEY.UP || e.keyCode === KEY.W) {
-				e.preventDefault();
-				rotate();
-			} else if (e.keyCode === KEY.SPACE) {
-				e.preventDefault();
-				hardDrop();
-			}
+				const moveAction = MOVES[e.keyCode];
+				if (moveAction) {
+					e.preventDefault();
+					const action = (e.keyCode === KEY.LEFT || e.keyCode === KEY.A) ? 'left' :
+								   (e.keyCode === KEY.RIGHT || e.keyCode === KEY.D) ? 'right' : 'down';
+					logInput(action);
+					move(moveAction.dx, moveAction.dy);
+				} else if (e.keyCode === KEY.UP || e.keyCode === KEY.W) {
+					e.preventDefault();
+					logInput('rotate');
+					rotate();
+				} else if (e.keyCode === KEY.SPACE) {
+					e.preventDefault();
+					logInput('hardDrop');
+					hardDrop();
+				}
 			}
 
 			initializeCanvas();

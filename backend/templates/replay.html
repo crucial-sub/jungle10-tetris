@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="ko">
+	<head>
+		<meta charset="utf-8" />
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1, shrink-to-fit=no"
+		/>
+		<script src="https://cdn.tailwindcss.com"></script>
+
+		<!-- 구글폰트 -->
+		<link
+			href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap"
+			rel="stylesheet"
+		/>
+
+		<title>정글 테트리스 - 리플레이</title>
+	</head>
+
+	<body class="bg-white flex justify-center items-center min-h-screen">
+		<main class="flex gap-20">
+			<div class="flex flex-col items-center">
+				<canvas id="game-board" class="bg-black"></canvas>
+				<!-- Replay Controls -->
+				<div class="flex items-center gap-4 mt-6">
+					<button id="play-btn" class="px-6 py-3 bg-green-500 text-white text-xl font-bold rounded-lg hover:bg-green-600 transition">
+						재생
+					</button>
+					<button id="pause-btn" class="px-6 py-3 bg-yellow-500 text-white text-xl font-bold rounded-lg hover:bg-yellow-600 transition hidden">
+						일시정지
+					</button>
+					<button id="restart-btn" class="px-6 py-3 bg-blue-500 text-white text-xl font-bold rounded-lg hover:bg-blue-600 transition">
+						처음부터
+					</button>
+				</div>
+				<!-- Speed Control -->
+				<div class="flex items-center gap-4 mt-4">
+					<span class="text-gray-600 text-lg">재생 속도:</span>
+					<button class="speed-btn px-4 py-2 bg-gray-200 rounded-lg hover:bg-gray-300 transition" data-speed="0.5">0.5x</button>
+					<button class="speed-btn px-4 py-2 bg-green-500 text-white rounded-lg" data-speed="1">1x</button>
+					<button class="speed-btn px-4 py-2 bg-gray-200 rounded-lg hover:bg-gray-300 transition" data-speed="2">2x</button>
+				</div>
+			</div>
+			<aside>
+				<h1 class="text-4xl text-green-500 font-bold text-center mb-4">리플레이</h1>
+				<div class="flex flex-col justify-start text-green-500 text-3xl gap-6 mt-10">
+					<div id="player-name">플레이어</div>
+					<div id="score">점수 : 0</div>
+					<div id="time">경과 시간 : 0초</div>
+					<div id="status" class="text-blue-500">준비</div>
+				</div>
+				<div class="mt-10">
+					<a href="/main" class="text-green-500 text-xl hover:underline">← 메인으로 돌아가기</a>
+				</div>
+			</aside>
+		</main>
+
+		<script>
+			// Game constants
+			const COLS = 10;
+			const ROWS = 15;
+			const BLOCK_SIZE = window.innerHeight * 0.06;
+			const COLORS = ['cyan', 'blue', 'orange', 'yellow', 'green', 'purple', 'red'];
+
+			const BLOCK_SHAPES = [
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [2, 0]], center: [0, 0] },
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [1, -1]], center: [0, 0] },
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [1, 1]], center: [0, 0] },
+				{ blocks: [[0, 0], [1, 0], [0, 1], [1, 1]], center: null },
+				{ blocks: [[-1, 0], [0, 0], [0, 1], [1, 1]], center: [0, 0] },
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [0, 1]], center: [0, 0] },
+				{ blocks: [[-1, 1], [0, 1], [0, 0], [1, 0]], center: [0, 0] }
+			];
+
+			// Seeded PRNG (Mulberry32 algorithm)
+			class SeededRandom {
+				constructor(seed) {
+					this.state = seed;
+				}
+				next() {
+					let t = this.state += 0x6D2B79F5;
+					t = Math.imul(t ^ t >>> 15, t | 1);
+					t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+					return ((t ^ t >>> 14) >>> 0) / 4294967296;
+				}
+				nextInt(max) {
+					return Math.floor(this.next() * max);
+				}
+			}
+
+			// Replay data from server
+			const gameType = '{{ game_type }}';
+			const players = {{ players | tojson }};
+			const gameSeed = {{ game_seed if game_seed else 'null' }};
+			const inputLog = {{ input_log | tojson }};
+
+			// For multiplayer, get first player's data
+			let replaySeed = gameSeed;
+			let replayInputs = inputLog;
+			let playerName = '플레이어';
+
+			if (gameType === 'multiplayer' && players.length > 0) {
+				// Use first player's replay data
+				const player = players[0];
+				replaySeed = player.game_seed || gameSeed;
+				replayInputs = player.input_log || inputLog;
+				playerName = player.name || '플레이어';
+			} else if (gameType === 'solo' && players.length > 0) {
+				playerName = players[0].name || '플레이어';
+			}
+
+			document.getElementById('player-name').textContent = playerName;
+
+			// Game state
+			const game = {
+				canvas: document.getElementById('game-board'),
+				ctx: null,
+				grid: [],
+				current: null,
+				over: false
+			};
+
+			let rng = null;
+			let score = 0;
+			let frameCount = 0;
+			let inputIndex = 0;
+			let isPlaying = false;
+			let playbackSpeed = 1;
+			let animationId = null;
+			let startTime = null;
+			let elapsedSeconds = 0;
+
+			// Initialize canvas
+			function initializeCanvas() {
+				game.canvas.width = COLS * BLOCK_SIZE;
+				game.canvas.height = ROWS * BLOCK_SIZE;
+				game.ctx = game.canvas.getContext('2d');
+				game.ctx.scale(BLOCK_SIZE, BLOCK_SIZE);
+			}
+
+			function initializeBoard() {
+				return Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+			}
+
+			function generateBlock() {
+				const index = rng.nextInt(BLOCK_SHAPES.length);
+				const { blocks, center } = BLOCK_SHAPES[index];
+				const color = COLORS[index];
+				const minDy = Math.min(...blocks.map(([_, dy]) => dy));
+
+				const newBlock = {
+					x: 4,
+					y: -minDy,
+					color,
+					blocks: blocks.map(b => [...b]),
+					center: center ? [...center] : null
+				};
+
+				if (isColliding(game.grid, newBlock, newBlock.x, newBlock.y)) {
+					game.over = true;
+				}
+
+				return newBlock;
+			}
+
+			function isColliding(grid, block, offsetX, offsetY, override = null, strict = false) {
+				const cells = override || block.blocks;
+				return cells.some(([dx, dy]) => {
+					const x = offsetX + dx;
+					const y = offsetY + dy;
+					if (x < 0 || x >= COLS || y >= ROWS || (strict && y < 0)) return true;
+					return y >= 0 && grid[y][x] !== 0;
+				});
+			}
+
+			function move(dx, dy) {
+				if (game.over) return;
+				const { current, grid } = game;
+				const newX = current.x + dx;
+				const newY = current.y + dy;
+
+				if (!isColliding(grid, current, newX, newY)) {
+					current.x = newX;
+					current.y = newY;
+				} else if (dy === 1) {
+					const lines = placeBlock();
+					addScore(lines);
+					game.current = generateBlock();
+				}
+			}
+
+			function rotate() {
+				if (game.over) return;
+				const { current, grid } = game;
+				if (!current.center) return;
+
+				const rotated = current.blocks.map(([x, y]) => {
+					const [cx, cy] = current.center;
+					const relX = x - cx;
+					const relY = y - cy;
+					return [-relY + cx, relX + cy];
+				});
+
+				if (!isColliding(grid, current, current.x, current.y, rotated, true)) {
+					current.blocks = rotated;
+				}
+			}
+
+			function hardDrop() {
+				if (game.over) return;
+				const block = game.current;
+				while (!isColliding(game.grid, block, block.x, block.y + 1)) {
+					block.y++;
+				}
+				const lines = placeBlock();
+				addScore(lines, true);
+				game.current = generateBlock();
+			}
+
+			function placeBlock() {
+				const { grid, current } = game;
+				const colorIndex = COLORS.indexOf(current.color) + 1;
+
+				current.blocks.forEach(([dx, dy]) => {
+					const x = current.x + dx;
+					const y = current.y + dy;
+					if (y >= 0) grid[y][x] = colorIndex;
+				});
+
+				return clearLines();
+			}
+
+			function clearLines() {
+				let cleared = 0;
+				for (let y = ROWS - 1; y >= 0; y--) {
+					if (game.grid[y].every(cell => cell !== 0)) {
+						game.grid.splice(y, 1);
+						game.grid.unshift(Array(COLS).fill(0));
+						y++;
+						cleared++;
+					}
+				}
+				return cleared;
+			}
+
+			function addScore(lines, isHardDrop = false) {
+				const base = lines === 1 ? 100 : lines === 2 ? 300 : lines === 3 ? 500 : lines >= 4 ? 800 : 0;
+				const gained = isHardDrop ? base * 2 : base;
+				score += gained;
+				document.getElementById('score').textContent = `점수: ${score}`;
+			}
+
+			function render() {
+				const ctx = game.ctx;
+				ctx.clearRect(0, 0, COLS, ROWS);
+
+				// Draw grid
+				ctx.strokeStyle = '#444';
+				ctx.lineWidth = 0.05;
+				for (let r = 0; r <= ROWS; r++) {
+					ctx.beginPath();
+					ctx.moveTo(0, r);
+					ctx.lineTo(COLS, r);
+					ctx.stroke();
+				}
+				for (let c = 0; c <= COLS; c++) {
+					ctx.beginPath();
+					ctx.moveTo(c, 0);
+					ctx.lineTo(c, ROWS);
+					ctx.stroke();
+				}
+
+				// Draw fixed blocks
+				for (let y = 0; y < ROWS; y++) {
+					for (let x = 0; x < COLS; x++) {
+						const cell = game.grid[y][x];
+						if (cell !== 0) {
+							ctx.fillStyle = COLORS[cell - 1];
+							ctx.fillRect(x, y, 1, 1);
+						}
+					}
+				}
+
+				// Draw current block
+				if (game.current) {
+					const block = game.current;
+					ctx.fillStyle = block.color;
+					block.blocks.forEach(([dx, dy]) => {
+						ctx.fillRect(block.x + dx, block.y + dy, 1, 1);
+					});
+				}
+			}
+
+			function executeInput(action) {
+				switch (action) {
+					case 'left':
+						move(-1, 0);
+						break;
+					case 'right':
+						move(1, 0);
+						break;
+					case 'down':
+						move(0, 1);
+						break;
+					case 'rotate':
+						rotate();
+						break;
+					case 'hardDrop':
+						hardDrop();
+						break;
+				}
+			}
+
+			function resetGame() {
+				rng = new SeededRandom(replaySeed);
+				game.grid = initializeBoard();
+				game.current = generateBlock();
+				game.over = false;
+				score = 0;
+				frameCount = 0;
+				inputIndex = 0;
+				elapsedSeconds = 0;
+				document.getElementById('score').textContent = '점수: 0';
+				document.getElementById('time').textContent = '경과 시간: 0초';
+				document.getElementById('status').textContent = '준비';
+				render();
+			}
+
+			function animate(now = 0) {
+				if (!isPlaying || game.over) {
+					if (game.over) {
+						document.getElementById('status').textContent = '완료';
+					}
+					return;
+				}
+
+				frameCount++;
+
+				// Process inputs for current frame
+				while (inputIndex < replayInputs.length && replayInputs[inputIndex].frame <= frameCount) {
+					executeInput(replayInputs[inputIndex].action);
+					inputIndex++;
+				}
+
+				// Auto drop every ~60 frames (adjusted for speed)
+				if (frameCount % Math.round(60 / playbackSpeed) === 0) {
+					move(0, 1);
+				}
+
+				// Update elapsed time display
+				const newSeconds = Math.floor(frameCount / 60);
+				if (newSeconds !== elapsedSeconds) {
+					elapsedSeconds = newSeconds;
+					document.getElementById('time').textContent = `경과 시간: ${elapsedSeconds}초`;
+				}
+
+				render();
+				animationId = requestAnimationFrame(animate);
+			}
+
+			function startReplay() {
+				if (game.over) {
+					resetGame();
+				}
+				isPlaying = true;
+				document.getElementById('status').textContent = '재생 중';
+				document.getElementById('play-btn').classList.add('hidden');
+				document.getElementById('pause-btn').classList.remove('hidden');
+				animate();
+			}
+
+			function pauseReplay() {
+				isPlaying = false;
+				document.getElementById('status').textContent = '일시정지';
+				document.getElementById('play-btn').classList.remove('hidden');
+				document.getElementById('pause-btn').classList.add('hidden');
+				if (animationId) {
+					cancelAnimationFrame(animationId);
+				}
+			}
+
+			function restartReplay() {
+				pauseReplay();
+				resetGame();
+			}
+
+			function setSpeed(speed) {
+				playbackSpeed = speed;
+				document.querySelectorAll('.speed-btn').forEach(btn => {
+					if (parseFloat(btn.dataset.speed) === speed) {
+						btn.classList.remove('bg-gray-200');
+						btn.classList.add('bg-green-500', 'text-white');
+					} else {
+						btn.classList.add('bg-gray-200');
+						btn.classList.remove('bg-green-500', 'text-white');
+					}
+				});
+			}
+
+			// Event listeners
+			document.getElementById('play-btn').addEventListener('click', startReplay);
+			document.getElementById('pause-btn').addEventListener('click', pauseReplay);
+			document.getElementById('restart-btn').addEventListener('click', restartReplay);
+
+			document.querySelectorAll('.speed-btn').forEach(btn => {
+				btn.addEventListener('click', () => {
+					setSpeed(parseFloat(btn.dataset.speed));
+				});
+			});
+
+			// Initialize
+			initializeCanvas();
+			if (replaySeed) {
+				resetGame();
+			} else {
+				document.getElementById('status').textContent = '리플레이 데이터 없음';
+			}
+		</script>
+	</body>
+</html>

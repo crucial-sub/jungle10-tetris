@@ -375,27 +375,30 @@ def api_end_solo_game():
         user_id = get_jwt_identity()
         data = request.get_json()
         score = data.get('score', 0)
-        
+        input_log = data.get('input_log', [])
+        game_seed = data.get('game_seed')
+
         # 사용자 조회
         user = User.find_by_user_id(user_id)
         if not user:
             return jsonify({'error': '사용자를 찾을 수 없습니다'}), 404
-        
+
         # 개인 최고 점수 확인
         personal_best = score > user.solo_high_score
-        
-        # 게임 기록 저장
-        GameRecord.create_solo_record(user_id, user.name, score, 60)
-        
+
+        # 게임 기록 저장 (리플레이 데이터 포함)
+        record = GameRecord.create_solo_record(user_id, user.name, score, 60, input_log, game_seed)
+
         # 사용자 통계 업데이트
         user.update_stats(solo_score=score)
-        
+
         return jsonify({
             'message': '게임 결과가 저장되었습니다',
             'score': score,
-            'is_best': personal_best
+            'is_best': personal_best,
+            'game_id': record.game_id
         }), 200
-        
+
     except Exception as e:
         current_app.logger.error(f"End solo game error: {str(e)}")
         return jsonify({'error': '솔로 게임 종료 중 오류가 발생했습니다'}), 500
@@ -485,3 +488,48 @@ def api_get_wins_ranking():
     except Exception as e:
         current_app.logger.error(f"Get wins ranking error: {str(e)}")
         return jsonify({'error': '승리 랭킹 조회 중 오류가 발생했습니다'}), 500
+
+
+# ============================================================================
+# Replay 관련 엔드포인트
+# ============================================================================
+
+@main_bp.route('/replay/<game_id>')
+def replay(game_id):
+    """리플레이 페이지 렌더링"""
+    # 게임 기록 조회
+    record = GameRecord.find_by_game_id(game_id)
+    if not record:
+        flash('리플레이를 찾을 수 없습니다.', 'error')
+        return redirect(url_for('main.main'))
+
+    return render_template('replay.html',
+                         game_id=game_id,
+                         game_type=record.game_type,
+                         players=record.players,
+                         game_seed=record.game_seed,
+                         input_log=record.input_log)
+
+
+@main_bp.route('/api/replay/<game_id>')
+def api_get_replay(game_id):
+    """리플레이 데이터 조회 API"""
+    try:
+        record = GameRecord.find_by_game_id(game_id)
+        if not record:
+            return jsonify({'error': '리플레이를 찾을 수 없습니다'}), 404
+
+        return jsonify({
+            'game_id': record.game_id,
+            'game_type': record.game_type,
+            'players': record.players,
+            'winner_id': record.winner_id,
+            'duration': record.duration,
+            'game_seed': record.game_seed,
+            'input_log': record.input_log,
+            'created_at': record.created_at.isoformat() if record.created_at else None
+        }), 200
+
+    except Exception as e:
+        current_app.logger.error(f"Get replay error: {str(e)}")
+        return jsonify({'error': '리플레이 조회 중 오류가 발생했습니다'}), 500
