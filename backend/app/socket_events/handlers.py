@@ -178,7 +178,111 @@ def register_room_events(socketio):
 
 def register_game_events(socketio):
     """게임 관련 이벤트 등록"""
-    
+
+    # Store game engines for each room (room_id -> {user_id: TetrisEngine})
+    game_engines = {}
+
+    @socketio.on('game:init_engine')
+    def handle_init_engine(data):
+        """Initialize server-side game engine for validation"""
+        try:
+            user, error = get_current_user_from_socket()
+            if error:
+                emit('error', {'type': 'AUTH_ERROR', 'message': error})
+                return
+
+            room_id = data.get('room_id')
+            game_seed = data.get('game_seed')
+
+            if not room_id or not game_seed:
+                emit('error', {'type': 'VALIDATION_ERROR', 'message': '방 번호와 게임 시드가 필요합니다'})
+                return
+
+            # Initialize engine for this user in this room
+            from app.game import TetrisEngine
+            if room_id not in game_engines:
+                game_engines[room_id] = {}
+
+            game_engines[room_id][user.user_id] = TetrisEngine(game_seed)
+
+            emit('game:engine_ready', {
+                'room_id': room_id,
+                'state_hash': game_engines[room_id][user.user_id].get_state_hash()
+            })
+
+        except Exception as e:
+            current_app.logger.error(f"Init engine error: {str(e)}")
+            emit('error', {'type': 'SERVER_ERROR', 'message': '게임 엔진 초기화 중 오류가 발생했습니다'})
+
+    @socketio.on('game:input')
+    def handle_game_input(data):
+        """Handle game input for server-side validation"""
+        try:
+            user, error = get_current_user_from_socket()
+            if error:
+                emit('error', {'type': 'AUTH_ERROR', 'message': error})
+                return
+
+            room_id = data.get('room_id')
+            input_data = data.get('input', {})
+            seq = input_data.get('seq', 0)
+            action = input_data.get('action', '')
+
+            if not room_id:
+                emit('error', {'type': 'VALIDATION_ERROR', 'message': '방 번호가 필요합니다'})
+                return
+
+            # Get engine for this user
+            engine = game_engines.get(room_id, {}).get(user.user_id)
+            if not engine:
+                emit('game:input_ack', {
+                    'seq': seq,
+                    'valid': False,
+                    'reason': 'no_engine',
+                    'state_hash': None
+                })
+                return
+
+            # Apply input and get result
+            result = engine.apply_input(action, seq)
+
+            emit('game:input_ack', {
+                'seq': seq,
+                'valid': result['valid'],
+                'state_hash': result.get('state_hash'),
+                'score': result.get('score', 0),
+                'game_over': result.get('game_over', False)
+            })
+
+        except Exception as e:
+            current_app.logger.error(f"Game input error: {str(e)}")
+            emit('error', {'type': 'SERVER_ERROR', 'message': '입력 처리 중 오류가 발생했습니다'})
+
+    @socketio.on('game:request_state')
+    def handle_request_state(data):
+        """Request full game state for reconciliation"""
+        try:
+            user, error = get_current_user_from_socket()
+            if error:
+                emit('error', {'type': 'AUTH_ERROR', 'message': error})
+                return
+
+            room_id = data.get('room_id')
+            if not room_id:
+                emit('error', {'type': 'VALIDATION_ERROR', 'message': '방 번호가 필요합니다'})
+                return
+
+            engine = game_engines.get(room_id, {}).get(user.user_id)
+            if not engine:
+                emit('game:full_state', {'error': 'no_engine'})
+                return
+
+            emit('game:full_state', engine.get_full_state())
+
+        except Exception as e:
+            current_app.logger.error(f"Request state error: {str(e)}")
+            emit('error', {'type': 'SERVER_ERROR', 'message': '상태 조회 중 오류가 발생했습니다'})
+
     @socketio.on('game:score_update')
     def handle_score_update(data):
         """실시간 점수 업데이트 (쿠키 기반 JWT 인증)"""
@@ -227,6 +331,8 @@ def register_game_events(socketio):
                 return
             room_id = data.get('room_id')
             final_score = data.get('score', 0)
+            input_log = data.get('input_log', [])
+            game_seed = data.get('game_seed')
             if not room_id:
                 emit('error', {'type': 'VALIDATION_ERROR', 'message': '방 번호가 필요합니다'})
                 return
@@ -238,11 +344,13 @@ def register_game_events(socketio):
             if not room:
                 emit('error', {'type': 'ROOM_NOT_FOUND', 'message': '존재하지 않는 방입니다'})
                 return
-            # 최종 점수 및 finished 상태 업데이트
+            # 최종 점수, finished 상태, 리플레이 데이터 업데이트
             for participant in room.participants:
                 if participant['user_id'] == user.user_id:
                     participant['score'] = final_score
                     participant['finished'] = True
+                    participant['input_log'] = input_log
+                    participant['game_seed'] = game_seed
             room.save()
             current_app.logger.info(f"Updated score/finished for user {user.user_id}: {final_score}")
 
@@ -303,8 +411,91 @@ def register_game_events(socketio):
             current_app.logger.error(f"Game end error: {str(e)}")
             emit('error', {'type': 'SERVER_ERROR', 'message': '게임 종료 처리 중 오류가 발생했습니다'})
 
+def register_webrtc_events(socketio):
+    """WebRTC P2P 시그널링 이벤트 등록"""
+
+    @socketio.on('webrtc:offer')
+    def handle_webrtc_offer(data):
+        """WebRTC offer 전달"""
+        try:
+            user, error = get_current_user_from_socket()
+            if error:
+                emit('error', {'type': 'AUTH_ERROR', 'message': error})
+                return
+
+            room_id = data.get('room_id')
+            offer = data.get('offer')
+
+            if not room_id or not offer:
+                emit('error', {'type': 'VALIDATION_ERROR', 'message': 'room_id와 offer가 필요합니다'})
+                return
+
+            # Forward offer to other users in the room
+            socketio.emit('webrtc:offer', {
+                'offer': offer,
+                'from_user_id': user.user_id
+            }, room=room_id, skip_sid=request.sid)
+
+        except Exception as e:
+            current_app.logger.error(f"WebRTC offer error: {str(e)}")
+            emit('error', {'type': 'SERVER_ERROR', 'message': 'WebRTC offer 전달 중 오류가 발생했습니다'})
+
+    @socketio.on('webrtc:answer')
+    def handle_webrtc_answer(data):
+        """WebRTC answer 전달"""
+        try:
+            user, error = get_current_user_from_socket()
+            if error:
+                emit('error', {'type': 'AUTH_ERROR', 'message': error})
+                return
+
+            room_id = data.get('room_id')
+            answer = data.get('answer')
+
+            if not room_id or not answer:
+                emit('error', {'type': 'VALIDATION_ERROR', 'message': 'room_id와 answer가 필요합니다'})
+                return
+
+            # Forward answer to other users in the room
+            socketio.emit('webrtc:answer', {
+                'answer': answer,
+                'from_user_id': user.user_id
+            }, room=room_id, skip_sid=request.sid)
+
+        except Exception as e:
+            current_app.logger.error(f"WebRTC answer error: {str(e)}")
+            emit('error', {'type': 'SERVER_ERROR', 'message': 'WebRTC answer 전달 중 오류가 발생했습니다'})
+
+    @socketio.on('webrtc:ice_candidate')
+    def handle_ice_candidate(data):
+        """WebRTC ICE candidate 전달"""
+        try:
+            user, error = get_current_user_from_socket()
+            if error:
+                emit('error', {'type': 'AUTH_ERROR', 'message': error})
+                return
+
+            room_id = data.get('room_id')
+            candidate = data.get('candidate')
+
+            if not room_id:
+                emit('error', {'type': 'VALIDATION_ERROR', 'message': 'room_id가 필요합니다'})
+                return
+
+            # Forward ICE candidate to other users in the room
+            socketio.emit('webrtc:ice_candidate', {
+                'candidate': candidate,
+                'from_user_id': user.user_id
+            }, room=room_id, skip_sid=request.sid)
+
+        except Exception as e:
+            current_app.logger.error(f"WebRTC ICE candidate error: {str(e)}")
+            emit('error', {'type': 'SERVER_ERROR', 'message': 'ICE candidate 전달 중 오류가 발생했습니다'})
+
+
 def register_all_events(socketio):
     """모든 Socket.IO 이벤트 등록"""
     register_connection_events(socketio)
     register_room_events(socketio)
     register_game_events(socketio)
+    register_webrtc_events(socketio)
