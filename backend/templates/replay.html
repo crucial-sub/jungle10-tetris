@@ -62,6 +62,11 @@
 			const BLOCK_SIZE = window.innerHeight * 0.06;
 			const COLORS = ['cyan', 'blue', 'orange', 'yellow', 'green', 'purple', 'red'];
 
+			// 고정 타임스텝 상수 (Fixed Timestep Constants)
+			const FIXED_DELTA = 1000 / 60;  // 60 updates per second (16.67ms)
+			const DROP_INTERVAL = 1000;     // 1초마다 블록 자동 하강
+			const MAX_FRAME_SKIP = 5;       // 탭 전환 시 무한 루프 방지
+
 			const BLOCK_SHAPES = [
 				{ blocks: [[-1, 0], [0, 0], [1, 0], [2, 0]], center: [0, 0] },
 				{ blocks: [[-1, 0], [0, 0], [1, 0], [1, -1]], center: [0, 0] },
@@ -86,6 +91,11 @@
 				nextInt(max) {
 					return Math.floor(this.next() * max);
 				}
+			}
+
+			// 보간 헬퍼 함수 (Interpolation Helper)
+			function lerp(start, end, alpha) {
+				return start + (end - start) * alpha;
 			}
 
 			// Replay data from server
@@ -127,8 +137,13 @@
 			let isPlaying = false;
 			let playbackSpeed = 1;
 			let animationId = null;
-			let startTime = null;
 			let elapsedSeconds = 0;
+
+			// 고정 타임스텝 변수 (Fixed Timestep Variables)
+			let accumulator = 0;
+			let lastTime = 0;
+			let previousBlockY = 0;  // 보간용 이전 Y 위치
+			let dropCounter = 0;     // 블록 하강 타이머
 
 			// Initialize canvas
 			function initializeCanvas() {
@@ -250,7 +265,55 @@
 				document.getElementById('score').textContent = `점수: ${score}`;
 			}
 
-			function render() {
+			function executeInput(action) {
+				switch (action) {
+					case 'left':
+						move(-1, 0);
+						break;
+					case 'right':
+						move(1, 0);
+						break;
+					case 'down':
+						move(0, 1);
+						break;
+					case 'rotate':
+						rotate();
+						break;
+					case 'hardDrop':
+						hardDrop();
+						break;
+				}
+			}
+
+			// 게임 로직 업데이트 함수 (분리됨)
+			function update(delta) {
+				if (game.over) return;
+
+				frameCount++;
+
+				// 현재 프레임에 해당하는 입력 처리
+				while (inputIndex < replayInputs.length && replayInputs[inputIndex].frame <= frameCount) {
+					executeInput(replayInputs[inputIndex].action);
+					inputIndex++;
+				}
+
+				// 블록 자동 하강 (dropCounter 기반)
+				dropCounter += delta;
+				if (dropCounter >= DROP_INTERVAL) {
+					move(0, 1);
+					dropCounter -= DROP_INTERVAL;
+				}
+
+				// 경과 시간 UI 업데이트
+				const newSeconds = Math.floor(frameCount / 60);
+				if (newSeconds !== elapsedSeconds) {
+					elapsedSeconds = newSeconds;
+					document.getElementById('time').textContent = `경과 시간: ${elapsedSeconds}초`;
+				}
+			}
+
+			// 보간 렌더링 함수
+			function render(alpha = 1) {
 				const ctx = game.ctx;
 				ctx.clearRect(0, 0, COLS, ROWS);
 
@@ -281,34 +344,74 @@
 					}
 				}
 
-				// Draw current block
+				// Draw current block with interpolation (보간 적용)
 				if (game.current) {
-					const block = game.current;
-					ctx.fillStyle = block.color;
-					block.blocks.forEach(([dx, dy]) => {
-						ctx.fillRect(block.x + dx, block.y + dy, 1, 1);
-					});
+					drawCurrentBlock(alpha);
 				}
 			}
 
-			function executeInput(action) {
-				switch (action) {
-					case 'left':
-						move(-1, 0);
-						break;
-					case 'right':
-						move(1, 0);
-						break;
-					case 'down':
-						move(0, 1);
-						break;
-					case 'rotate':
-						rotate();
-						break;
-					case 'hardDrop':
-						hardDrop();
-						break;
+			// 현재 블록 보간 렌더링
+			function drawCurrentBlock(alpha) {
+				const block = game.current;
+				const ctx = game.ctx;
+
+				// Y 위치 보간 (부드러운 하강)
+				const interpolatedY = lerp(previousBlockY, block.y, alpha);
+
+				ctx.fillStyle = block.color;
+				block.blocks.forEach(([dx, dy]) => {
+					ctx.fillRect(block.x + dx, interpolatedY + dy, 1, 1);
+				});
+			}
+
+			// 고정 타임스텝 게임 루프 (배속 지원)
+			function gameLoop(now) {
+				if (!isPlaying || game.over) {
+					if (game.over) {
+						document.getElementById('status').textContent = '완료';
+					}
+					return;
 				}
+
+				// 첫 프레임 처리
+				if (lastTime === 0) {
+					lastTime = now;
+					animationId = requestAnimationFrame(gameLoop);
+					return;
+				}
+
+				const deltaTime = now - lastTime;
+				lastTime = now;
+
+				// 배속에 따라 deltaTime 조정
+				const adjustedDelta = deltaTime * playbackSpeed;
+				accumulator += adjustedDelta;
+
+				// 고정 간격으로 게임 로직 업데이트 (with MAX_FRAME_SKIP)
+				let updates = 0;
+				while (accumulator >= FIXED_DELTA && updates < MAX_FRAME_SKIP) {
+					// 보간용 이전 위치 저장
+					if (game.current) {
+						previousBlockY = game.current.y;
+					}
+
+					update(FIXED_DELTA);
+					accumulator -= FIXED_DELTA;
+					updates++;
+				}
+
+				// 너무 많이 밀린 경우 accumulator 리셋
+				if (accumulator > FIXED_DELTA * MAX_FRAME_SKIP) {
+					accumulator = 0;
+				}
+
+				// 보간 계수 계산 (0~1 사이)
+				const alpha = accumulator / FIXED_DELTA;
+
+				// 보간된 위치로 렌더링
+				render(alpha);
+
+				animationId = requestAnimationFrame(gameLoop);
 			}
 
 			function resetGame() {
@@ -320,42 +423,17 @@
 				frameCount = 0;
 				inputIndex = 0;
 				elapsedSeconds = 0;
+
+				// 고정 타임스텝 변수 초기화
+				accumulator = 0;
+				lastTime = 0;
+				previousBlockY = game.current ? game.current.y : 0;
+				dropCounter = 0;
+
 				document.getElementById('score').textContent = '점수: 0';
 				document.getElementById('time').textContent = '경과 시간: 0초';
 				document.getElementById('status').textContent = '준비';
 				render();
-			}
-
-			function animate(now = 0) {
-				if (!isPlaying || game.over) {
-					if (game.over) {
-						document.getElementById('status').textContent = '완료';
-					}
-					return;
-				}
-
-				frameCount++;
-
-				// Process inputs for current frame
-				while (inputIndex < replayInputs.length && replayInputs[inputIndex].frame <= frameCount) {
-					executeInput(replayInputs[inputIndex].action);
-					inputIndex++;
-				}
-
-				// Auto drop every ~60 frames (adjusted for speed)
-				if (frameCount % Math.round(60 / playbackSpeed) === 0) {
-					move(0, 1);
-				}
-
-				// Update elapsed time display
-				const newSeconds = Math.floor(frameCount / 60);
-				if (newSeconds !== elapsedSeconds) {
-					elapsedSeconds = newSeconds;
-					document.getElementById('time').textContent = `경과 시간: ${elapsedSeconds}초`;
-				}
-
-				render();
-				animationId = requestAnimationFrame(animate);
 			}
 
 			function startReplay() {
@@ -363,10 +441,11 @@
 					resetGame();
 				}
 				isPlaying = true;
+				lastTime = 0;  // 게임 루프 시작 시 초기화
 				document.getElementById('status').textContent = '재생 중';
 				document.getElementById('play-btn').classList.add('hidden');
 				document.getElementById('pause-btn').classList.remove('hidden');
-				animate();
+				gameLoop(performance.now());
 			}
 
 			function pauseReplay() {

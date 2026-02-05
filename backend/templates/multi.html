@@ -48,7 +48,7 @@
 			100% {
 				transform: rotate(360deg);
 			}
-		} 
+		}
 	</style>
 
 	<body class="bg-white flex justify-center items-center min-h-screen">
@@ -73,7 +73,7 @@
 			<div class="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[1000]">
 				 <span id="loader" class="loader"></span>
 			</div>
-			<div id="countdown" class="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 
+			<div id="countdown" class="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2
 					text-black text-[300px] hidden z-[1000] rotate-14">
 			</div>
 		</div>
@@ -90,6 +90,9 @@
 		</div>
 
 		<script>
+			// ============================================================================
+			// Socket.IO 연결 및 초기화
+			// ============================================================================
 			const socket = io('{{ socket_url }}', {
 				withCredentials: true
 			});
@@ -121,10 +124,18 @@
 			})
 			socket.emit('room:join',{ room_id });
 
+			// ============================================================================
+			// 게임 상수
+			// ============================================================================
 			const COLS = 10;
 			const ROWS = 15;
 			const BLOCK_SIZE = window.innerHeight * 0.06;
-			const GAME_TIME = 60; // 게임 시간 (초)
+			const GAME_TIME = 60;
+
+			// 고정 타임스텝 상수
+			const FIXED_DELTA = 1000 / 60;  // 60 updates per second (16.67ms)
+			const DROP_INTERVAL = 1000;      // 1초마다 블록 자동 하강
+			const MAX_FRAME_SKIP = 5;        // 최대 프레임 스킵 (무한 루프 방지)
 
 			const KEY = Object.freeze({
 				LEFT: 37,
@@ -139,9 +150,22 @@
 				[KEY.RIGHT]: { dx: 1, dy: 0 },
 				[KEY.DOWN]: { dx: 0, dy: 1 }
 			};
+
 			const COLORS = ['cyan', 'blue', 'orange', 'yellow', 'green', 'purple', 'red'];
 
-			// Seeded PRNG (Mulberry32 algorithm) for deterministic block generation
+			const BLOCK_SHAPES = [
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [2, 0]], center: [0, 0] },
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [1, -1]], center: [0, 0] },
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [1, 1]], center: [0, 0] },
+				{ blocks: [[0, 0], [1, 0], [0, 1], [1, 1]], center: null },
+				{ blocks: [[-1, 0], [0, 0], [0, 1], [1, 1]], center: [0, 0] },
+				{ blocks: [[-1, 0], [0, 0], [1, 0], [0, 1]], center: [0, 0] },
+				{ blocks: [[-1, 1], [0, 1], [0, 0], [1, 0]], center: [0, 0] }
+			];
+
+			// ============================================================================
+			// Seeded PRNG (Mulberry32 algorithm) - 결정론적 블록 생성용
+			// ============================================================================
 			class SeededRandom {
 				constructor(seed) {
 					this.state = seed;
@@ -157,13 +181,49 @@
 				}
 			}
 
-			// Game seed and RNG instance
+			// ============================================================================
+			// 게임 상태
+			// ============================================================================
+			const game = {
+				canvas: document.getElementById('game-board'),
+				ctx: null,
+				grid: [],
+				current: null,
+				over: false
+			};
+
+			// 고정 타임스텝용 변수
+			let accumulator = 0;
+			let lastTime = 0;
+			let dropCounter = 0;
+
+			// 보간용 이전 상태
+			let previousBlockY = 0;
+
+			// 게임 시간 관련
+			let gameTimeRemaining = GAME_TIME;
+			let lastSecond = 0;
+
+			// 점수
+			let score = 0;
+			let opponentScore = 0;
+
+			// Seeded RNG
 			let gameSeed = null;
 			let rng = null;
 
-			// Input logging for replay
+			// 리플레이용 입력 로그
 			const inputLog = { seed: null, startTime: null, inputs: [] };
 			let frameCount = 0;
+
+			// ============================================================================
+			// 유틸리티 함수
+			// ============================================================================
+
+			// 선형 보간 함수
+			function lerp(start, end, alpha) {
+				return start + (end - start) * alpha;
+			}
 
 			function logInput(action) {
 				inputLog.inputs.push({
@@ -173,11 +233,12 @@
 				});
 			}
 
-			// Client-Side Prediction variables
+			// ============================================================================
+			// 클라이언트 예측 (Client-Side Prediction)
+			// ============================================================================
 			let inputSequence = 0;
 			const pendingInputs = [];
 			let serverEngineReady = false;
-			let localStateHash = null;
 
 			function sendInput(action) {
 				inputSequence++;
@@ -203,7 +264,6 @@
 					} : null,
 					game_over: game.over
 				};
-				// Simple hash using JSON stringify
 				const stateStr = JSON.stringify(state);
 				let hash = 0;
 				for (let i = 0; i < stateStr.length; i++) {
@@ -216,17 +276,14 @@
 
 			// Handle server acknowledgment
 			socket.on('game:input_ack', function(data) {
-				// Remove acknowledged input from pending list
 				const ackSeq = data.seq;
 				const idx = pendingInputs.findIndex(i => i.seq === ackSeq);
 				if (idx !== -1) {
 					pendingInputs.splice(0, idx + 1);
 				}
 
-				// Check for state mismatch (basic validation)
 				if (data.state_hash && data.valid === false) {
 					console.warn('Server rejected input:', data);
-					// Request full state for reconciliation
 					socket.emit('game:request_state', { room_id: room_id });
 				}
 			});
@@ -239,7 +296,6 @@
 				}
 
 				console.log('Reconciling with server state');
-				// Restore server state
 				game.grid = data.grid;
 				score = data.score;
 				game.over = data.game_over;
@@ -252,15 +308,14 @@
 						blocks: data.current_block.blocks,
 						center: data.current_block.center
 					};
+					previousBlockY = game.current.y;
 				}
 
-				// Re-apply pending inputs
 				pendingInputs.forEach(input => {
 					executeInputLocally(input.action);
 				});
 
-				updateScore(score);
-				render();
+				updateScoreDisplay(score);
 			});
 
 			socket.on('game:engine_ready', function(data) {
@@ -270,9 +325,9 @@
 
 			function executeInputLocally(action) {
 				switch (action) {
-					case 'left': move(-1, 0); break;
-					case 'right': move(1, 0); break;
-					case 'down': move(0, 1); break;
+					case 'left': moveBlock(-1, 0); break;
+					case 'right': moveBlock(1, 0); break;
+					case 'down': moveBlock(0, 1); break;
 					case 'rotate': rotate(); break;
 					case 'hardDrop': hardDrop(); break;
 				}
@@ -356,10 +411,9 @@
 				}
 
 				async createOffer() {
-					// Create data channel before creating offer
 					this.dataChannel = this.peerConnection.createDataChannel('gameData', {
-						ordered: false,  // Unordered for lower latency
-						maxRetransmits: 0  // No retransmits for real-time data
+						ordered: false,
+						maxRetransmits: 0
 					});
 
 					this.setupDataChannel(this.dataChannel);
@@ -376,7 +430,6 @@
 				async handleOffer(offer) {
 					await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
 
-					// Listen for data channel from initiator
 					this.peerConnection.ondatachannel = (event) => {
 						this.dataChannel = event.channel;
 						this.setupDataChannel(this.dataChannel);
@@ -456,18 +509,14 @@
 				}
 			}
 
-			// P2P connection instance
 			let p2pConnection = null;
 
-			// Initialize P2P when game starts (initiator is the first player to join)
 			function initP2P(isInitiator) {
 				p2pConnection = new P2PConnection(room_id, socket, isInitiator);
 				p2pConnection.init();
 
-				// Handle incoming P2P messages
 				p2pConnection.onMessage((data) => {
 					if (data.type === 'score') {
-						// Update opponent score received via P2P
 						if (data.user_id !== userId) {
 							opponentScore = data.score;
 							document.getElementById('opponentScore').textContent = `점수: ${opponentScore}`;
@@ -476,19 +525,15 @@
 				});
 			}
 
-			// Send score update (try P2P first, fallback to Socket.IO)
 			function sendScoreUpdate(totalScore) {
 				const scoreData = { type: 'score', score: totalScore, user_id: userId };
 
-				// Try P2P first
 				if (p2pConnection && p2pConnection.send(scoreData)) {
-					// Also send via Socket.IO for server validation/recording
 					socket.emit('game:score_update', {
 						room_id: room_id,
 						score: totalScore
 					});
 				} else {
-					// Fallback to Socket.IO only
 					socket.emit('game:score_update', {
 						room_id: room_id,
 						score: totalScore
@@ -496,35 +541,48 @@
 				}
 			}
 
-			const BLOCK_SHAPES = [
-				{ blocks: [[-1, 0], [0, 0], [1, 0], [2, 0]], center: [0, 0] },
-				{ blocks: [[-1, 0], [0, 0], [1, 0], [1, -1]], center: [0, 0] },
-				{ blocks: [[-1, 0], [0, 0], [1, 0], [1, 1]], center: [0, 0] },
-				{ blocks: [[0, 0], [1, 0], [0, 1], [1, 1]], center: null },
-				{ blocks: [[-1, 0], [0, 0], [0, 1], [1, 1]], center: [0, 0] },
-				{ blocks: [[-1, 0], [0, 0], [1, 0], [0, 1]], center: [0, 0] },
-				{ blocks: [[-1, 1], [0, 1], [0, 0], [1, 0]], center: [0, 0] }
-			];
+			// Socket.IO fallback listener for score updates
+			socket.on('game:score_update', function(data) {
+				const { players } = data;
+				const opponentData = players.filter((player) => player.user_id !== userId)[0];
+				if (opponentData) {
+					const totalOpponentScore = opponentData.score;
+					if (totalOpponentScore !== opponentScore) {
+						opponentScore = totalOpponentScore;
+						document.getElementById('opponentScore').textContent = `점수: ${opponentScore}`;
+					}
+				}
+			});
 
-			const game = {
-				canvas: document.getElementById('game-board'),
-				ctx: null,
-				grid: [],
-				current: null,
-				over: false
-			};
+			// ============================================================================
+			// 캔버스 초기화
+			// ============================================================================
+			function initializeCanvas() {
+				game.canvas.width = COLS * BLOCK_SIZE;
+				game.canvas.height = ROWS * BLOCK_SIZE;
+				game.ctx = game.canvas.getContext('2d');
+				game.ctx.scale(BLOCK_SIZE, BLOCK_SIZE);
+			}
 
-			const time = {
-				start: 0,
-				elapsed: 0,
-				interval: 1000,
-				remaining: GAME_TIME,
-				lastTick: 0
-			};
+			function initializeBoard() {
+				return Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+			}
 
-			let score = 0;
-			let opponentScore = 0;
+			// ============================================================================
+			// UI 업데이트
+			// ============================================================================
+			function updateTimeDisplay() {
+				document.getElementById('time').textContent = `남은 시간: ${gameTimeRemaining}초`;
+			}
 
+			function updateScoreDisplay(totalScore = 0) {
+				document.getElementById('score').textContent = `점수: ${totalScore}`;
+				sendScoreUpdate(totalScore);
+			}
+
+			// ============================================================================
+			// 게임 시작 카운트다운
+			// ============================================================================
 			function gameStartCountdown() {
 				const loader = document.querySelector('#loader')
 				loader.remove()
@@ -538,73 +596,135 @@
 				const countdownInterval = setInterval(() => {
 					count--;
 					if (count > 0) {
-					countdownEl.textContent = count;
+						countdownEl.textContent = count;
 					} else if (count === 0) {
-					countdownEl.textContent = 'GO!';
+						countdownEl.textContent = 'GO!';
 					} else {
-					clearInterval(countdownInterval);
-					loadingScreen.remove();
-					startGame();
+						clearInterval(countdownInterval);
+						loadingScreen.remove();
+						startGame();
 					}
 				}, 1000);
 			}
 
-			function initializeCanvas() {
-				game.canvas.width = COLS * BLOCK_SIZE;
-				game.canvas.height = ROWS * BLOCK_SIZE;
-				game.ctx = game.canvas.getContext('2d');
-				game.ctx.scale(BLOCK_SIZE, BLOCK_SIZE);
-			}
-
-			function initializeBoard() {
-				return Array.from({ length: ROWS }, () => Array(COLS).fill(0));
-			}
-
-			function updateTime() {
-				document.getElementById('time').textContent = `남은 시간: ${time.remaining}초`;
-			}
-
+			// ============================================================================
+			// 게임 시작
+			// ============================================================================
 			function startGame() {
-				// Initialize seeded random for deterministic block generation
+				// 시드 기반 랜덤 초기화
 				gameSeed = Date.now();
 				rng = new SeededRandom(gameSeed);
 
-				// Initialize input log for replay
+				// 리플레이용 입력 로그 초기화
 				inputLog.seed = gameSeed;
 				inputLog.startTime = performance.now();
 				inputLog.inputs = [];
 				frameCount = 0;
 
-				// Reset client-side prediction state
+				// 클라이언트 예측 상태 초기화
 				inputSequence = 0;
 				pendingInputs.length = 0;
 				serverEngineReady = false;
 
-				// Initialize server-side engine for validation
+				// 서버 측 게임 엔진 초기화 요청
 				socket.emit('game:init_engine', { room_id: room_id, game_seed: gameSeed });
 
+				// 게임 상태 초기화
 				game.grid = initializeBoard();
 				game.current = generateBlock();
 				game.over = false;
 				score = 0;
-				updateScore();
-				time.start = performance.now();
-				time.remaining = GAME_TIME;
-				time.lastTick = 0;
-				updateTime();
-				animate();
-				render();
+
+				// 고정 타임스텝 변수 초기화
+				accumulator = 0;
+				lastTime = performance.now();
+				dropCounter = 0;
+				previousBlockY = game.current ? game.current.y : 0;
+
+				// 시간 초기화
+				gameTimeRemaining = GAME_TIME;
+				lastSecond = Math.floor(lastTime / 1000);
+
+				updateScoreDisplay(0);
+				updateTimeDisplay();
+
+				// 게임 루프 시작
+				requestAnimationFrame(gameLoop);
 			}
 
+			// ============================================================================
+			// 게임 루프 (고정 타임스텝 + 보간)
+			// ============================================================================
+			function gameLoop(now) {
+				if (game.over) {
+					render(1);
+					if (!hasGameEnded) {
+						hasGameEnded = true;
+						socketGameEnd();
+					}
+					return;
+				}
 
-			function render() {
+				const deltaTime = now - lastTime;
+				lastTime = now;
+				accumulator += deltaTime;
+
+				let updates = 0;
+
+				while (accumulator >= FIXED_DELTA && updates < MAX_FRAME_SKIP) {
+					if (game.current) {
+						previousBlockY = game.current.y;
+					}
+
+					update(FIXED_DELTA);
+					accumulator -= FIXED_DELTA;
+					updates++;
+				}
+
+				if (accumulator > FIXED_DELTA * MAX_FRAME_SKIP) {
+					accumulator = 0;
+				}
+
+				const alpha = accumulator / FIXED_DELTA;
+				render(alpha);
+
+				requestAnimationFrame(gameLoop);
+			}
+
+			// ============================================================================
+			// 게임 로직 업데이트 (고정 타임스텝)
+			// ============================================================================
+			function update(delta) {
+				frameCount++;
+
+				dropCounter += delta;
+				if (dropCounter >= DROP_INTERVAL) {
+					moveBlock(0, 1);
+					dropCounter -= DROP_INTERVAL;
+				}
+
+				const currentSecond = Math.floor(performance.now() / 1000);
+				if (currentSecond !== lastSecond) {
+					lastSecond = currentSecond;
+					gameTimeRemaining--;
+					updateTimeDisplay();
+
+					if (gameTimeRemaining <= 0) {
+						game.over = true;
+					}
+				}
+			}
+
+			// ============================================================================
+			// 렌더링 (보간 적용)
+			// ============================================================================
+			function render(alpha = 1) {
 				clear();
 				drawGrid();
 				drawFixedBlocks();
-				if (game.current) drawCurrentBlock();
-				 if (game.over && !hasGameEnded) {
-					hasGameEnded = true;
-					socketGameEnd();
+
+				if (game.current) {
+					drawCurrentBlock(alpha);
 				}
 			}
 
@@ -634,26 +754,31 @@
 				const ctx = game.ctx;
 				for (let y = 0; y < ROWS; y++) {
 					for (let x = 0; x < COLS; x++) {
-					const cell = game.grid[y][x];
-					if (cell !== 0) {
-						ctx.fillStyle = COLORS[cell - 1];
-						ctx.fillRect(x, y, 1, 1);
-					}
+						const cell = game.grid[y][x];
+						if (cell !== 0) {
+							ctx.fillStyle = COLORS[cell - 1];
+							ctx.fillRect(x, y, 1, 1);
+						}
 					}
 				}
 			}
 
-			function drawCurrentBlock() {
+			function drawCurrentBlock(alpha) {
 				const ctx = game.ctx;
 				const block = game.current;
+
+				const interpolatedY = lerp(previousBlockY, block.y, alpha);
+
 				ctx.fillStyle = block.color;
 				block.blocks.forEach(([dx, dy]) => {
-					ctx.fillRect(block.x + dx, block.y + dy, 1, 1);
+					ctx.fillRect(block.x + dx, interpolatedY + dy, 1, 1);
 				});
 			}
 
+			// ============================================================================
+			// 블록 생성
+			// ============================================================================
 			function generateBlock() {
-				// Use seeded random for deterministic block generation (replay support)
 				const index = rng ? rng.nextInt(BLOCK_SHAPES.length) : Math.floor(Math.random() * BLOCK_SHAPES.length);
 				const { blocks, center } = BLOCK_SHAPES[index];
 				const color = COLORS[index];
@@ -663,87 +788,102 @@
 					x: 4,
 					y: -minDy,
 					color,
-					blocks,
-					center
+					blocks: blocks.map(b => [...b]),
+					center: center ? [...center] : null
 				};
 
 				if (isColliding(game.grid, newBlock, newBlock.x, newBlock.y)) {
 					game.over = true;
+				}
+
+				previousBlockY = newBlock.y;
+
+				return newBlock;
 			}
 
-			return newBlock;
+			// ============================================================================
+			// 블록 이동/회전/하드드롭
+			// ============================================================================
+			function moveBlock(dx, dy) {
+				if (game.over || !game.current) return;
+
+				const { current, grid } = game;
+				const newX = current.x + dx;
+				const newY = current.y + dy;
+
+				if (!isColliding(grid, current, newX, newY)) {
+					if (dx !== 0 || dy !== 1 || dropCounter < DROP_INTERVAL) {
+						previousBlockY = newY;
+					}
+					current.x = newX;
+					current.y = newY;
+				} else if (dy === 1) {
+					const lines = placeBlock();
+					addScore(lines);
+					game.current = generateBlock();
+				}
 			}
 
 			function move(dx, dy) {
-			if (game.over) return;
-			const { current, grid } = game;
-			const newX = current.x + dx;
-			const newY = current.y + dy;
-
-			if (!isColliding(grid, current, newX, newY)) {
-				current.x = newX;
-				current.y = newY;
-				render();
-			} else if (dy === 1) {
-				const lines = placeBlock();
-				addScore(lines);
-				game.current = generateBlock();
-				render();
-			}
+				previousBlockY = game.current ? game.current.y : 0;
+				moveBlock(dx, dy);
 			}
 
 			function rotate() {
-			if (game.over) return;
-			const { current, grid } = game;
-			if (!current.center) return;
+				if (game.over || !game.current) return;
 
-			const rotated = current.blocks.map(([x, y]) => {
-				const [cx, cy] = current.center;
-				const relX = x - cx;
-				const relY = y - cy;
-				return [-relY + cx, relX + cy];
-			});
+				const { current, grid } = game;
+				if (!current.center) return;
 
-			if (!isColliding(grid, current, current.x, current.y, rotated, true)) {
-				current.blocks = rotated;
-				render();
-			}
+				const rotated = current.blocks.map(([x, y]) => {
+					const [cx, cy] = current.center;
+					const relX = x - cx;
+					const relY = y - cy;
+					return [-relY + cx, relX + cy];
+				});
+
+				if (!isColliding(grid, current, current.x, current.y, rotated, true)) {
+					current.blocks = rotated;
+				}
 			}
 
 			function hardDrop() {
-			if (game.over) return;
-			const block = game.current;
-			while (!isColliding(game.grid, block, block.x, block.y + 1)) {
-				block.y++;
-			}
-			const lines = placeBlock();
-			addScore(lines, true);
-			game.current = generateBlock();
-			render();
+				if (game.over || !game.current) return;
+
+				const block = game.current;
+				while (!isColliding(game.grid, block, block.x, block.y + 1)) {
+					block.y++;
+				}
+				previousBlockY = block.y;
+				const lines = placeBlock();
+				addScore(lines, true);
+				game.current = generateBlock();
 			}
 
+			// ============================================================================
+			// 블록 배치 및 라인 클리어
+			// ============================================================================
 			function placeBlock() {
-			const { grid, current } = game;
-			const colorIndex = COLORS.indexOf(current.color) + 1;
+				const { grid, current } = game;
+				const colorIndex = COLORS.indexOf(current.color) + 1;
 
-			current.blocks.forEach(([dx, dy]) => {
-				const x = current.x + dx;
-				const y = current.y + dy;
-				if (y >= 0) grid[y][x] = colorIndex;
-			});
+				current.blocks.forEach(([dx, dy]) => {
+					const x = current.x + dx;
+					const y = current.y + dy;
+					if (y >= 0) grid[y][x] = colorIndex;
+				});
 
-			const linesCleared = clearLines();
-			return linesCleared;
+				return clearLines();
 			}
 
 			function isColliding(grid, block, offsetX, offsetY, override = null, strict = false) {
-			const cells = override || block.blocks;
-			return cells.some(([dx, dy]) => {
-				const x = offsetX + dx;
-				const y = offsetY + dy;
-				if (x < 0 || x >= COLS || y >= ROWS || (strict && y < 0)) return true;
-				return y >= 0 && grid[y][x] !== 0;
-			});
+				const cells = override || block.blocks;
+				return cells.some(([dx, dy]) => {
+					const x = offsetX + dx;
+					const y = offsetY + dy;
+					if (x < 0 || x >= COLS || y >= ROWS || (strict && y < 0)) return true;
+					return y >= 0 && grid[y][x] !== 0;
+				});
 			}
 
 			function clearLines() {
@@ -759,72 +899,27 @@
 				return cleared;
 			}
 
+			// ============================================================================
+			// 점수 계산
+			// ============================================================================
 			function addScore(lines, isHardDrop = false) {
 				const base = lines === 1 ? 100 : lines === 2 ? 300 : lines === 3 ? 500 : lines >= 4 ? 800 : 0;
 				const gained = isHardDrop ? base * 2 : base;
 				score += gained;
-				if(gained) updateScore(score);
+				if (gained) updateScoreDisplay(score);
 			}
 
-			function updateScore(totalScore = 0) {
-				document.getElementById('score').textContent = `점수: ${totalScore}`;
-				// Use P2P with Socket.IO fallback
-				sendScoreUpdate(totalScore);
-			}
-
-			// Socket.IO fallback listener for score updates
-			socket.on('game:score_update', function(data) {
-				const { players } = data;
-				const opponentData = players.filter((player) => player.user_id !== userId)[0];
-				if (opponentData) {
-					const totalOpponentScore = opponentData.score;
-					if (totalOpponentScore !== opponentScore) {
-						opponentScore = totalOpponentScore;
-						document.getElementById('opponentScore').textContent = `점수: ${opponentScore}`;
-					}
-				}
-			});
-
-			function animate(now = 0) {
-				if (game.over) {
-					render();
-					return;
-				}
-
-				// Increment frame count for replay synchronization
-				frameCount++;
-
-				time.elapsed = now - time.start;
-
-				if (time.elapsed > time.interval) {
-					time.start = now;
-					move(0, 1);
-				}
-
-				if (Math.floor(now / 1000) !== Math.floor(time.lastTick / 1000)) {
-					time.remaining--;
-					time.lastTick = now;
-					updateTime();
-
-					if (time.remaining <= 0) {
-						game.over = true;
-						render();
-						return;
-					}
-				}
-
-				render();
-				requestAnimationFrame(animate);
-			}
-
+			// ============================================================================
+			// 키보드 입력 처리
+			// ============================================================================
 			function onKeyDown(e) {
 				const moveAction = MOVES[e.keyCode];
 				if (moveAction) {
 					e.preventDefault();
 					const action = e.keyCode === KEY.LEFT ? 'left' : e.keyCode === KEY.RIGHT ? 'right' : 'down';
 					logInput(action);
-					sendInput(action);  // Send to server for validation
-					move(moveAction.dx, moveAction.dy);  // Execute locally immediately (prediction)
+					sendInput(action);
+					move(moveAction.dx, moveAction.dy);
 				} else if (e.keyCode === KEY.UP) {
 					e.preventDefault();
 					logInput('rotate');
@@ -838,6 +933,9 @@
 				}
 			}
 
+			// ============================================================================
+			// 게임 종료 처리
+			// ============================================================================
 			function socketGameEnd() {
 				socket.on('game:end', function(data) {
 					const {status} = data
@@ -855,19 +953,15 @@
 				})
 			}
 
-			// room:leave 이벤트 리스너 등록
 			socket.on('room:leave', function(data) {
 				console.log('방 나가기 이벤트 수신:', data);
-				// 여기에 방을 나간 사용자에 대한 처리 로직 추가
-				// 예: 플레이어 목록 업데이트, UI 업데이트 등
 			})
 
 			function openModal(score, status, data = {}) {
 				const modal = document.getElementById("modal");
 				const modalContent = document.getElementById("modal-content");
-				const modalBg = document.querySelector(".modal-bg");
 				modal.classList.remove("hidden");
-				
+
 				if(status === 'waiting') {
 					const html = `
 						<div class="text-green-500 text-[32px]" >
@@ -878,26 +972,29 @@
 				} else if(status === 'finished') {
 					const result = data.is_draw ? '무승부' : (data.winner === userId ? '승리' : '패배');
 					const html = `
-						    <div class="flex flex-col justify-center items-center gap-12 text-center">
-      							<p class="text-[48px] font-bold text-green-500">${result}</p>
-      							<p class="text-green-500 text-[40px]">점수: ${score}</p>
-      							<button id="confirm-btn" class="mt-[22px] w-[180px] h-[72px] bg-green-500 text-white text-[40px] font-bold rounded-[20px] hover:bg-green-600 transition text-center items-centern">확인</button>
-							</div>
-						`
-						modalContent.innerHTML = html;
-						const confirmBtn = document.getElementById('confirm-btn')
-						confirmBtn.addEventListener('click',()=>{ 
-							socket.emit('room:leave', {
-								room_id: room_id
-							})
-							socket.on('room:leave', (data) => {
-								console.log(data)
-							})
-							window.location.href = 'main.html'
+						<div class="flex flex-col justify-center items-center gap-12 text-center">
+							<p class="text-[48px] font-bold text-green-500">${result}</p>
+							<p class="text-green-500 text-[40px]">점수: ${score}</p>
+							<button id="confirm-btn" class="mt-[22px] w-[180px] h-[72px] bg-green-500 text-white text-[40px] font-bold rounded-[20px] hover:bg-green-600 transition text-center items-center">확인</button>
+						</div>
+					`
+					modalContent.innerHTML = html;
+					const confirmBtn = document.getElementById('confirm-btn')
+					confirmBtn.addEventListener('click',()=>{
+						socket.emit('room:leave', {
+							room_id: room_id
 						})
-					}
+						socket.on('room:leave', (data) => {
+							console.log(data)
+						})
+						window.location.href = 'main.html'
+					})
 				}
+			}
 
+			// ============================================================================
+			// 초기화 및 시작
+			// ============================================================================
 			initializeCanvas();
 			drawGrid();
 			document.addEventListener('keydown', onKeyDown);
